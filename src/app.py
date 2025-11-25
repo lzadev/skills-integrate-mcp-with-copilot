@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
+import json
+import uuid
 from pathlib import Path
+from threading import Lock
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -78,6 +82,84 @@ activities = {
 }
 
 
+# Simple in-memory admin sessions (token -> username)
+_sessions = {}
+_sessions_lock = Lock()
+
+
+def _load_teachers():
+    """Load teachers' credentials from `teachers.json` next to this file.
+    The file format is expected to be:
+    {"teachers": [{"username": "teacher1", "password": "secret"}, ...]}
+    """
+    try:
+        p = Path(__file__).parent / "teachers.json"
+        if not p.exists():
+            return []
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("teachers", [])
+    except Exception:
+        return []
+
+
+TEACHERS = _load_teachers()
+
+
+def _check_admin_token(authorization: str | None) -> bool:
+    """Check Authorization header of form: 'Bearer <token>' and validate session."""
+    if not authorization:
+        return False
+    if not authorization.lower().startswith("bearer "):
+        return False
+    token = authorization.split(" ", 1)[1].strip()
+    with _sessions_lock:
+        return token in _sessions
+
+
+def _create_session(username: str) -> str:
+    token = uuid.uuid4().hex
+    with _sessions_lock:
+        _sessions[token] = username
+    return token
+
+
+def _destroy_session(token: str) -> None:
+    with _sessions_lock:
+        _sessions.pop(token, None)
+
+
+
+class _LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/admin/login")
+def admin_login(req: _LoginRequest):
+    """Authenticate a teacher and return a short-lived token.
+
+    The token is a simple UUID returned in JSON: {"token": "..."}.
+    This is intentionally minimal for the exercise; consider stronger
+    authentication in production.
+    """
+    for t in TEACHERS:
+        if t.get("username") == req.username and t.get("password") == req.password:
+            token = _create_session(req.username)
+            return {"token": token}
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+
+@app.post("/admin/logout")
+def admin_logout(authorization: str | None = Header(None)):
+    """Invalidate an admin session token provided via `Authorization: Bearer <token>`."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=400, detail="Missing or invalid Authorization header")
+    token = authorization.split(" ", 1)[1].strip()
+    _destroy_session(token)
+    return {"message": "Logged out"}
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -89,11 +171,19 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, authorization: str | None = Header(None)):
+    """Sign up a student for an activity.
+
+    This action is restricted to authenticated teachers (Admin Mode).
+    Provide header `Authorization: Bearer <token>` obtained from `/admin/login`.
+    """
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Require admin
+    if not _check_admin_token(authorization):
+        raise HTTPException(status_code=403, detail="Admin credentials required to sign up students")
 
     # Get the specific activity
     activity = activities[activity_name]
@@ -111,11 +201,19 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, authorization: str | None = Header(None)):
+    """Unregister a student from an activity.
+
+    This action is restricted to authenticated teachers (Admin Mode).
+    Provide header `Authorization: Bearer <token>` obtained from `/admin/login`.
+    """
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Require admin
+    if not _check_admin_token(authorization):
+        raise HTTPException(status_code=403, detail="Admin credentials required to unregister students")
 
     # Get the specific activity
     activity = activities[activity_name]
